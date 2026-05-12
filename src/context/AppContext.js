@@ -183,11 +183,26 @@ export function AppProvider({ children }) {
     const target = all.find(r => r.id === id);
     const updated = await storage.deleteReport(id);
     setReports(updated);
-    // Sync deletion to DB
-    if (target?.dbId) {
-      api.deleteReport(target.dbId).catch(() => {});
+    // Sync deletion to DB.
+    // DB-fetched reports store the DB id in .id directly.
+    // Locally-created reports (before first DB sync) store it in .dbId.
+    const dbId = target?.dbId || target?.id;
+    if (dbId) {
+      api.deleteReport(dbId).catch(() => {});
     }
   }, []);
+
+  // ── Refresh reports from DB ──────────────────────────
+  const refreshReports = useCallback(async () => {
+    if (!user?.id) return;
+    try {
+      const apiReports = await api.getReports(user.id);
+      if (Array.isArray(apiReports)) {
+        setReports(apiReports);
+        await storage.saveReports(apiReports);
+      }
+    } catch (_) {}
+  }, [user]);
 
   // ── Detection Actions ────────────────────────────────
   const handleDetectionEvent = useCallback(async (event) => {
@@ -258,7 +273,9 @@ export function AppProvider({ children }) {
     clearLogs,
     addReport,
     deleteReport,
+    refreshReports,
   };
+
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

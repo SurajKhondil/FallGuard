@@ -17,8 +17,8 @@ async function request(path, options = {}) {
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: res.statusText }));
-    throw new Error(err.message || 'Request failed');
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || err.message || 'Request failed');
   }
 
   return res.json();
@@ -32,6 +32,11 @@ export const api = {
   }),
 
   updateUser: (id, data) => request(`/users/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  }),
+
+  changePassword: (id, data) => request(`/users/${id}/password`, {
     method: 'PUT',
     body: JSON.stringify(data),
   }),
@@ -69,14 +74,56 @@ export const api = {
     body: JSON.stringify(data),
   }),
 
-  // ── WebSocket (for live detection feed from Team 1) ─
-  connectWebSocket(token, onMessage) {
-    const ws = new WebSocket(`ws://10.165.111.54:5000/live?token=${token}`);
+  // ── AI Video Upload (Team 1 integration) ────────────
+  uploadVideo: async (videoUri, userId) => {
+    const formData = new FormData();
+    formData.append('file', {
+      uri: videoUri,
+      name: 'analysis.mp4',
+      type: 'video/mp4',
+    });
+    if (userId) formData.append('user_id', String(userId));
+
+    const res = await fetch(`${BASE_URL}/upload`, {
+      method: 'POST',
+      body: formData,
+      // Don't set Content-Type — fetch sets multipart boundary automatically
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || 'Upload failed');
+    }
+    return res.json();
+  },
+
+  // ── WebSocket — Live Fall Events (Team 1 Flask /ws) ─
+  connectWebSocket(onMessage) {
+    const ws = new WebSocket(`ws://${BASE_URL.replace('http://', '').replace('/api', '')}/ws`);
+    ws.onopen = () => console.log('[WS] Connected to live detection');
     ws.onmessage = (e) => {
-      try {
-        onMessage(JSON.parse(e.data));
-      } catch (_) { }
+      try { onMessage(JSON.parse(e.data)); } catch (_) { }
     };
+    ws.onerror = (e) => console.warn('[WS] Error:', e.message);
+    ws.onclose = () => console.log('[WS] Disconnected');
     return ws;
   },
+
+  // ── Real-Time Camera Frame Detection ─────────────────
+  // Sends a single base64 JPEG frame to Flask for MediaPipe analysis.
+  detectFrame: (base64Image, userId, timestamp) =>
+    request('/detect-frame', {
+      method: 'POST',
+      body: JSON.stringify({
+        frame: base64Image,
+        user_id: userId,
+        timestamp: timestamp ?? (Date.now() / 1000),
+      }),
+    }),
+
+  // Resets the server-side per-user detector state when monitoring stops.
+  resetDetector: (userId) =>
+    request('/detect-frame/reset', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId }),
+    }).catch(() => {}),
 };

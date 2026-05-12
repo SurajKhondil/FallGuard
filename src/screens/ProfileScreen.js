@@ -1,12 +1,19 @@
-import React, { useState } from 'react';
+import { Ionicons } from '@expo/vector-icons';
+import { useState } from 'react';
 import {
-  View, Text, StyleSheet, ScrollView, TextInput,
-  TouchableOpacity, StatusBar, Alert,
+  Alert,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons } from '@expo/vector-icons';
-import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
 import { useApp } from '../context/AppContext';
+import { api } from '../services/api';
+import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
 
 export default function ProfileScreen({ navigation }) {
   const { user, updateUser, logout } = useApp();
@@ -24,15 +31,26 @@ export default function ProfileScreen({ navigation }) {
     Alert.alert('Success', 'Profile updated successfully.');
   };
 
-  const handleChangePassword = () => {
+  const handleChangePassword = async () => {
     if (!currentPassword || !newPassword) {
       Alert.alert('Error', 'Please enter both current and new passwords.');
       return;
     }
-    // Mocking password change
-    Alert.alert('Success', 'Password changed successfully.');
-    setCurrentPassword('');
-    setNewPassword('');
+    if (newPassword.length < 6) {
+      Alert.alert('Error', 'New password must be at least 6 characters.');
+      return;
+    }
+    try {
+      await api.changePassword(user.id, {
+        currentPassword,
+        newPassword,
+      });
+      Alert.alert('Success', 'Password changed successfully.');
+      setCurrentPassword('');
+      setNewPassword('');
+    } catch (err) {
+      Alert.alert('Failed', err.message || 'Could not change password.');
+    }
   };
 
   const handleLogout = () => {
@@ -56,7 +74,7 @@ export default function ProfileScreen({ navigation }) {
       </View>
 
       <ScrollView contentContainerStyle={styles.scroll}>
-        
+
         {/* Profile Avatar */}
         <View style={styles.avatarContainer}>
           <View style={styles.avatar}>
@@ -67,12 +85,12 @@ export default function ProfileScreen({ navigation }) {
         {/* Personal Info */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Personal Information</Text>
-          
+
           <View style={styles.field}>
             <Text style={styles.label}>Full Name</Text>
             <TextInput style={styles.input} value={name} onChangeText={setName} placeholder="John Doe" />
           </View>
-          
+
           <View style={styles.field}>
             <Text style={styles.label}>Email Address</Text>
             <TextInput style={styles.input} value={email} onChangeText={setEmail} keyboardType="email-address" />
@@ -92,7 +110,7 @@ export default function ProfileScreen({ navigation }) {
         {/* Change Password */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Change Password</Text>
-          
+
           <View style={styles.field}>
             <Text style={styles.label}>Current Password</Text>
             <View style={styles.passInputWrapper}>
@@ -134,7 +152,7 @@ const styles = StyleSheet.create({
   },
   backBtn: { padding: 4 },
   headerTitle: { fontSize: FONTS.lg, fontWeight: '700', color: COLORS.textPrimary },
-  
+
   scroll: { padding: SPACING.md, paddingBottom: SPACING.xxl, gap: SPACING.lg },
 
   avatarContainer: { alignItems: 'center', marginTop: SPACING.md },
@@ -150,7 +168,7 @@ const styles = StyleSheet.create({
     padding: SPACING.md, borderWidth: 1, borderColor: COLORS.border, gap: 12,
   },
   sectionTitle: { fontSize: FONTS.md, fontWeight: '700', color: COLORS.textPrimary, marginBottom: 4 },
-  
+
   field: { gap: 6 },
   label: { fontSize: FONTS.sm, fontWeight: '600', color: COLORS.textSecondary },
   input: {

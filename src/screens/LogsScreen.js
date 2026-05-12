@@ -134,7 +134,7 @@ export default function LogsScreen() {
       {/* List */}
       <FlatList
         data={filtered}
-        keyExtractor={(item) => item.id}
+        keyExtractor={(item) => String(item.id)}
         renderItem={({ item }) => <EventCard event={item} />}
         contentContainerStyle={styles.list}
         showsVerticalScrollIndicator={false}

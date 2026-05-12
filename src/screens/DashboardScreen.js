@@ -1,43 +1,170 @@
-import React, { useEffect, useRef, useState } from 'react';
-import {
-  View, Text, StyleSheet, ScrollView, TouchableOpacity,
-  Animated, StatusBar, Switch, Dimensions, Modal, Alert, Linking,
-} from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import * as ImagePicker from 'expo-image-picker';
-import * as FileSystem from 'expo-file-system/legacy';
-import * as Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
-import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
+import * as ImagePicker from 'expo-image-picker';
+import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system/legacy';
+import { useEffect, useRef, useState } from 'react';
+import {
+  Alert,
+  Animated,
+  Dimensions,
+  Image,
+  Linking,
+  Modal,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Switch,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import AlertModal from '../components/AlertModal';
+import ConfidenceBar from '../components/ConfidenceBar';
+import DetectionStatusPanel from '../components/DetectionStatusPanel';
+import LiveActivityGraph from '../components/LiveActivityGraph';
 import { useApp } from '../context/AppContext';
 import { useDetection } from '../hooks/useDetection';
-import DetectionStatusPanel from '../components/DetectionStatusPanel';
-import ConfidenceBar from '../components/ConfidenceBar';
-import AlertModal from '../components/AlertModal';
-import LiveActivityGraph from '../components/LiveActivityGraph';
+import { api } from '../services/api';
+import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
 
 const { width } = Dimensions.get('window');
+
+// Download a report CSV from the server then share it as a local file
+async function downloadAndShare(httpUrl, filename) {
+  try {
+    const localUri = FileSystem.cacheDirectory + filename;
+    const { status } = await FileSystem.downloadAsync(httpUrl, localUri);
+    if (status !== 200) throw new Error(`Download failed (status ${status})`);
+    await Sharing.shareAsync(localUri, {
+      mimeType: 'text/csv',
+      dialogTitle: 'Save / Share Report',
+      UTI: 'public.comma-separated-values-text',
+    });
+  } catch (err) {
+    Alert.alert('Download Failed', `Could not download report: ${err.message}`);
+  }
+}
 
 export default function DashboardScreen({ navigation }) {
   const {
     user, detectionStatus, isMonitoring, setIsMonitoring,
-    currentConfidence, activeAlert, dismissAlert, mode, changeMode, logs, reports, addReport, deleteReport
+    currentConfidence, setDetectionStatus, setCurrentConfidence,
+    activeAlert, dismissAlert, mode, changeMode,
+    logs, reports, addReport, deleteReport, refreshReports, handleDetectionEvent,
   } = useApp();
   const { startMonitoring, stopMonitoring, triggerFall, triggerNormal } = useDetection();
-  
+
   const [permission, requestPermission] = useCameraPermissions();
   const [videoUri, setVideoUri] = useState(null);
   const [cameraModalVisible, setCameraModalVisible] = useState(false);
   const [cameraFacing, setCameraFacing] = useState('back');
+  const [annotatedFrame, setAnnotatedFrame] = useState(null); // base64 JPEG with landmarks drawn by server
+  const [cameraReady, setCameraReady] = useState(false);      // true once CameraView fires onCameraReady
+  const [isUploading, setIsUploading] = useState(false);       // prevents duplicate video uploads
 
   const headerAnim = useRef(new Animated.Value(0)).current;
   const scanAnim = useRef(new Animated.Value(0)).current;
+  const cameraRef = useRef(null);           // ref to CameraView for frame capture
+  const frameIntervalRef = useRef(null);    // interval handle
+  const sessionStartRef = useRef(Date.now() / 1000); // session timestamp base
+  const isCapturingRef = useRef(false);     // mutex: prevents concurrent takePictureAsync calls
 
   useEffect(() => {
     Animated.timing(headerAnim, { toValue: 1, duration: 600, useNativeDriver: true }).start();
   }, []);
+
+  // ── Real-time frame capture loop ──────────────────────────
+  // Fires every 1.5s while monitoring AND camera is ready inside the modal.
+  // Waits for onCameraReady before first capture to prevent Android crash.
+  useEffect(() => {
+    const shouldCapture = isMonitoring && cameraModalVisible && cameraReady;
+
+    if (shouldCapture) {
+      sessionStartRef.current = Date.now() / 1000;
+
+      // Small delay so camera sensor stabilizes after onCameraReady
+      const startTimeout = setTimeout(() => {
+        frameIntervalRef.current = setInterval(async () => {
+          // Skip if a previous capture+API call is still in progress
+          if (!cameraRef.current || !cameraReady || isCapturingRef.current) return;
+          isCapturingRef.current = true;
+          try {
+            // NOTE: skipProcessing removed — causes silent failures on Android
+            const photo = await cameraRef.current.takePictureAsync({
+              base64: true,
+              quality: 0.3,   // Lower quality = faster upload + less server load
+            });
+            if (!photo?.base64) { isCapturingRef.current = false; return; }
+
+            const timestamp = Date.now() / 1000 - sessionStartRef.current;
+            const result = await api.detectFrame(photo.base64, user?.id, timestamp);
+
+            // Map server event to app status
+            const eventMap = {
+              CONFIRMED_FALL: 'FALL',
+              FALL_DETECTED: 'FALL',
+              NORMAL: 'NORMAL',
+              NO_PERSON: 'NO_PERSON',
+            };
+            const appType = eventMap[result.event] || 'NORMAL';
+            setDetectionStatus(appType);
+            setCurrentConfidence(result.confidence || 0);
+
+            // Display the skeleton-annotated frame returned by MediaPipe server
+            if (result.annotated_frame) {
+              setAnnotatedFrame(`data:image/jpeg;base64,${result.annotated_frame}`);
+            }
+
+            // On confirmed fall — trigger full alert + log to DB
+            if (result.event === 'CONFIRMED_FALL') {
+              handleDetectionEvent({
+                id: `cam_${Date.now()}`,
+                type: 'FALL',
+                timestamp: new Date().toISOString(),
+                confidence: result.confidence || 0.9,
+                source: 'live_camera',
+              });
+            }
+          } catch (err) {
+            console.warn('[Camera] Frame skip:', err.message);
+          } finally {
+            isCapturingRef.current = false;  // always release mutex
+          }
+        }, 1000); // 1s interval — gives server time to process MediaPipe
+      }, 800); // 800ms grace period for camera sensor to stabilize
+
+      return () => {
+        clearTimeout(startTimeout);
+        if (frameIntervalRef.current) {
+          clearInterval(frameIntervalRef.current);
+          frameIntervalRef.current = null;
+        }
+      };
+
+    } else {
+      // Stop capturing
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
+      // Clear annotated frame when done
+      if (!isMonitoring) {
+        setAnnotatedFrame(null);
+        // Reset server detector when monitoring stops
+        if (user?.id) api.resetDetector(user.id);
+      }
+    }
+
+    return () => {
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
+    };
+  }, [isMonitoring, cameraModalVisible, cameraReady, user, handleDetectionEvent, setDetectionStatus, setCurrentConfidence]);
 
   useEffect(() => {
     if (isMonitoring) {
@@ -70,6 +197,9 @@ export default function DashboardScreen({ navigation }) {
   };
 
   const pickVideo = async () => {
+    // Guard: prevent duplicate uploads if user taps multiple times
+    if (isUploading) return;
+
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     let result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['videos'],
@@ -78,66 +208,79 @@ export default function DashboardScreen({ navigation }) {
     });
 
     if (!result.canceled) {
-      setVideoUri(result.assets[0].uri);
-      
+      const videoUri = result.assets[0].uri;
+      setVideoUri(videoUri);
+      setIsUploading(true); // Lock button until upload completes
+
       // Stop live monitoring if active
       if (isMonitoring) stopMonitoring();
 
-      Alert.alert("Analyzing Video", "Please wait while the AI scans for falls...");
-      
-      // Simulate Video Analysis
-      setTimeout(async () => {
-        // 70% chance to detect a fall for demonstration
-        const fallDetected = Math.random() > 0.3;
-        
+      Alert.alert(
+        '🤖 AI Analysis Started',
+        'Uploading video to AI server. This may take 10–30 seconds depending on video length...'
+      );
+
+      try {
+        // ── Real AI analysis via Team 1 Flask endpoint ──
+        const data = await api.uploadVideo(videoUri, user?.id);
+        const fallDetected = data.fall_detected;
+        const events = data.events || [];
+        const aiUsed = data.ai_used;
+
         if (fallDetected) {
           triggerFall();
-          Alert.alert("Fall Detected!", "A fall was detected in the video. Generating report...");
-          
-          // Generate Report
-          try {
-            const timeStr = new Date().toLocaleTimeString();
-            const confidence = (0.8 + Math.random() * 0.15).toFixed(2);
-            let csvContent = `Video Analysis Report\n`;
-            csvContent += `File,${result.assets[0].uri.split('/').pop()}\n`;
-            csvContent += `Time Analyzed,${new Date().toLocaleString()}\n`;
-            csvContent += `Fall Detected,YES\n`;
-            csvContent += `Fall Timestamp (Simulated),00:00:03\n`;
-            csvContent += `Confidence Rate,${(confidence * 100).toFixed(0)}%\n`;
 
-            const fileName = `Video_Fall_Report_${Date.now()}.csv`;
-            const fileUri = `${FileSystem.documentDirectory}${fileName}`;
-            await FileSystem.writeAsStringAsync(fileUri, csvContent);
-            
-            await addReport({
-              id: Date.now().toString(),
-              name: fileName,
-              uri: fileUri,
-              date: new Date().toISOString(),
-              type: 'Video Analysis',
-              fallDetected: true,
-              confidence: parseFloat(confidence),
-            });
+          const firstFall = events.find(e => e.event === 'CONFIRMED_FALL');
+          const fallTime = firstFall ? `at ${firstFall.time_sec}s` : '';
+          const direction = firstFall?.direction || '';
 
-            Alert.alert(
-              "Report Saved",
-              "The video analysis report has been saved to your dashboard.",
-              [
-                { text: 'View Now', onPress: () => Sharing.shareAsync(fileUri, { dialogTitle: 'Download Fall Report' }) },
-                { text: 'OK', style: 'cancel' }
-              ]
-            );
-          } catch (error) {
-            console.error("Export Error: ", error);
-          }
+          // Refresh reports list from DB immediately
+          await refreshReports();
 
+          Alert.alert(
+            '⚠️ Fall Detected!',
+            `A confirmed fall was detected ${fallTime}${direction ? ` (${direction})` : ''}. Report saved to your dashboard.`,
+            [
+              {
+                text: 'View Report',
+                onPress: () => {
+                  if (user?.id) {
+                    api.getReports(user.id).then(rpts => {
+                      if (Array.isArray(rpts) && rpts.length > 0) {
+                        const latest = rpts[0];
+                        // latest.uri is now an HTTP URL — download then share
+                        if (latest.uri) {
+                          downloadAndShare(latest.uri, latest.name);
+                        }
+                      }
+                    }).catch(() => { });
+                  }
+                }
+              },
+              { text: 'OK', style: 'cancel' }
+            ]
+          );
         } else {
           triggerNormal();
-          Alert.alert("Normal Activity", "No falls were detected in the video.");
+          // Refresh even on no-fall (report is still saved)
+          await refreshReports();
+          Alert.alert(
+            '✅ No Fall Detected',
+            `AI analysis complete${aiUsed ? ' (MediaPipe)' : ' (simulation)'}. No falls were found in this video.`
+          );
         }
-      }, 3000); // 3 sec analysis
+      } catch (error) {
+        console.error('Upload error:', error);
+        Alert.alert(
+          'Analysis Failed',
+          `Could not analyze video: ${error.message}\n\nMake sure Flask server is running.`
+        );
+      } finally {
+        setIsUploading(false); // Always unlock button
+      }
     }
   };
+
 
   const recentFalls = logs.filter((l) => l.type === 'FALL').length;
   const totalEvents = logs.length;
@@ -197,6 +340,7 @@ export default function DashboardScreen({ navigation }) {
                   style={styles.openCameraBtn}
                   onPress={() => {
                     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    setCameraReady(false); // reset so next open waits for onCameraReady
                     setCameraModalVisible(true);
                   }}
                 >
@@ -241,32 +385,72 @@ export default function DashboardScreen({ navigation }) {
                 <Ionicons name="close" size={24} color={COLORS.textPrimary} />
               </TouchableOpacity>
             </View>
-            
+
             <View style={styles.modalCameraWrapper}>
               {permission?.granted ? (
                 <View style={{ flex: 1 }}>
-                  <CameraView style={styles.modalCamera} facing={cameraFacing} />
+                  {/* CameraView — onCameraReady ensures we don't capture before sensor is live */}
+                  <CameraView
+                    ref={cameraRef}
+                    style={styles.modalCamera}
+                    facing={cameraFacing}
+                    onCameraReady={() => setCameraReady(true)}
+                  />
+
+                  {/* Annotated frame overlay: shows MediaPipe landmark skeleton from server */}
+                  {annotatedFrame ? (
+                    <Image
+                      source={{ uri: annotatedFrame }}
+                      style={styles.annotatedOverlay}
+                      resizeMode="stretch"
+                    />
+                  ) : null}
+
                   <View style={styles.absoluteOverlay}>
                     <View style={styles.scanBox}>
                       <View style={styles.scanCornerTL} />
                       <View style={styles.scanCornerTR} />
                       <View style={styles.scanCornerBL} />
                       <View style={styles.scanCornerBR} />
-                      
-                      {isMonitoring && (
+
+                      {isMonitoring && !annotatedFrame && (
                         <Animated.View style={[
-                          styles.laserLine, 
+                          styles.laserLine,
                           { transform: [{ translateY: scanAnim.interpolate({ inputRange: [0, 1], outputRange: [-250, 250] }) }] }
                         ]} />
                       )}
-                      
-                      <Text style={styles.scanOverlayText}>Head-to-toe scan active...</Text>
+
+                      <Text style={styles.scanOverlayText}>
+                        {isMonitoring ? (annotatedFrame ? '🦴 Landmark Detection Active' : 'Waiting for pose...') : 'Paused'}
+                      </Text>
                     </View>
                   </View>
-                  
+
+                  {/* Real-time AI Status Bar */}
+                  <View style={styles.aiStatusBar}>
+                    <View style={[
+                      styles.aiStatusDot,
+                      {
+                        backgroundColor:
+                          detectionStatus === 'FALL' ? '#F85149' :
+                            detectionStatus === 'NORMAL' ? '#3FB950' : '#8B949E'
+                      }
+                    ]} />
+                    <Text style={styles.aiStatusText}>
+                      {detectionStatus === 'FALL' ? '⚠️ FALL DETECTED' :
+                        detectionStatus === 'NORMAL' ? '✅ NORMAL' :
+                          detectionStatus === 'NO_PERSON' ? '👤 NO PERSON' : '🔍 SCANNING'}
+                    </Text>
+                    {currentConfidence > 0 && (
+                      <Text style={styles.aiConfText}>
+                        {(currentConfidence * 100).toFixed(0)}%
+                      </Text>
+                    )}
+                  </View>
+
                   {/* Flip Camera Button */}
-                  <TouchableOpacity 
-                    style={styles.flipCameraBtn} 
+                  <TouchableOpacity
+                    style={styles.flipCameraBtn}
                     onPress={() => {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
                       setCameraFacing(f => f === 'back' ? 'front' : 'back');
@@ -281,7 +465,7 @@ export default function DashboardScreen({ navigation }) {
                 </View>
               )}
             </View>
-            
+
             <View style={styles.modalFooter}>
               <DetectionStatusPanel
                 status={detectionStatus}
@@ -330,14 +514,15 @@ export default function DashboardScreen({ navigation }) {
                       `Generated: ${new Date(report.date).toLocaleString()}`,
                       [
                         {
-                          text: '📂 Open File',
-                          onPress: () => Linking.openURL(report.uri).catch(() =>
-                            Alert.alert('Cannot Open', 'Your device cannot open CSV files directly. Use Share instead.')
-                          ),
+                          text: '🌐 Open in Browser',
+                          onPress: () =>
+                            Linking.openURL(report.uri).catch(() =>
+                              Alert.alert('Cannot Open', 'Could not open URL. Try Share instead.')
+                            ),
                         },
                         {
-                          text: '📤 Share / Download',
-                          onPress: () => Sharing.shareAsync(report.uri, { dialogTitle: 'Save Report' }),
+                          text: '📥 Download & Share',
+                          onPress: () => downloadAndShare(report.uri, report.name),
                         },
                         { text: 'Cancel', style: 'cancel' },
                       ]
@@ -513,7 +698,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10, borderRadius: RADIUS.full, marginTop: 8,
   },
   openCameraBtnText: { color: '#FFF', fontWeight: '700', fontSize: FONTS.sm },
-  
+
   scanCornerTL: { position: 'absolute', top: 12, left: 12, width: 20, height: 20, borderTopWidth: 2, borderLeftWidth: 2, borderColor: COLORS.primary, borderRadius: 2, zIndex: 10 },
   scanCornerTR: { position: 'absolute', top: 12, right: 12, width: 20, height: 20, borderTopWidth: 2, borderRightWidth: 2, borderColor: COLORS.primary, borderRadius: 2, zIndex: 10 },
   scanCornerBL: { position: 'absolute', bottom: 12, left: 12, width: 20, height: 20, borderBottomWidth: 2, borderLeftWidth: 2, borderColor: COLORS.primary, borderRadius: 2, zIndex: 10 },
@@ -533,6 +718,11 @@ const styles = StyleSheet.create({
   closeModalBtn: { padding: 4 },
   modalCameraWrapper: { flex: 1, backgroundColor: '#000', overflow: 'hidden', position: 'relative' },
   modalCamera: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  annotatedOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 5,          // above camera, below UI controls
+    opacity: 0.92,      // slight transparency so camera is still visible underneath
+  },
   absoluteOverlay: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: 'center',
@@ -566,7 +756,7 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.bgCard, borderRadius: RADIUS.lg,
     padding: SPACING.md, borderWidth: 1, borderColor: COLORS.border,
   },
-  
+
   reportHeaderRow: {
     flexDirection: 'row', alignItems: 'center',
     justifyContent: 'space-between', marginBottom: 10,
@@ -632,4 +822,17 @@ const styles = StyleSheet.create({
   modeInfo: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   modeTitle: { color: COLORS.textPrimary, fontWeight: '700', fontSize: FONTS.md },
   modeDesc: { color: COLORS.textSecondary, fontSize: FONTS.xs, marginTop: 2 },
+
+  // ── Real-time AI Camera Status Bar ─────────────────
+  aiStatusBar: {
+    position: 'absolute', bottom: 70, left: 12, right: 12,
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: 'rgba(13,17,23,0.85)', borderRadius: 12,
+    paddingHorizontal: 14, paddingVertical: 10,
+    borderWidth: 1, borderColor: 'rgba(88,166,255,0.3)',
+  },
+  aiStatusDot: { width: 10, height: 10, borderRadius: 5 },
+  aiStatusText: { flex: 1, color: '#FFF', fontWeight: '700', fontSize: 13 },
+  aiConfText: { color: '#58A6FF', fontWeight: '800', fontSize: 13 },
 });
+
