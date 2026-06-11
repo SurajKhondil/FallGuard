@@ -93,7 +93,7 @@ AI-Fall_Detection_System/
 ### Step 1 — Clone & Install Frontend Dependencies
 
 ```bash
-git clone https://github.com/Its-Jyoti405/AI_BASED_FALL_DETECTION_SYSTEM.git
+git clone https://github.com/SurajKhondil/AI_BASED_FALL_DETECTION_SYSTEM.git
 cd AI-Fall_Detection_System
 npm install
 ```
