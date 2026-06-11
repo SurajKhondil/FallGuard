@@ -1,8 +1,10 @@
 # 🛡️ FallGuard AI — AI-Based Fall Detection System
 
-<div align="center">
-  <img src="assets/app-screenshots.jpg" alt="FallGuard AI App Screenshots" width="100%" />
-</div>
+<p align="center">
+  <img src="assets/app-screenshots(5).jpeg" alt="Dashboard" width="30%" />
+  <img src="assets/app-screenshots(1).jpeg" alt="Alert" width="30%" />
+  <img src="assets/app-screenshots(4).jpeg" alt="Stats" width="30%" />
+</p>
 
 <p align="center">
   <a href="#-features">Features</a> • 
